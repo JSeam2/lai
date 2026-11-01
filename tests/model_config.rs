@@ -1,0 +1,204 @@
+use std::{
+    fs,
+    io::{Read, Write},
+    net::TcpListener,
+    path::Path,
+    process::{Command, Output, Stdio},
+    thread,
+};
+
+fn run(home: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lai"))
+        .env("HOME", home)
+        .env_remove("RUST_LOG")
+        .args(args)
+        .output()
+        .expect("CLI should start")
+}
+
+#[test]
+fn set_update_and_unset_preserve_other_configuration() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let path = home.path().join(".lai/config.toml");
+    fs::create_dir_all(
+        home.path()
+            .join(".lai/models/DreamFoundries/supergemma4-e4b-abliterated-6bit"),
+    )
+    .expect("installed model directory should be created");
+    let set = run(
+        home.path(),
+        &[
+            "config",
+            "model",
+            "set",
+            "DreamFoundries/supergemma4-e4b-abliterated-6bit",
+        ],
+    );
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let original = fs::read_to_string(&path).expect("config should exist");
+    assert!(original.contains("model = \"DreamFoundries/supergemma4-e4b-abliterated-6bit\""));
+    fs::write(
+        &path,
+        format!("# Keep this comment\n{original}other = 42\n"),
+    )
+    .expect("fixture should be written");
+    let duplicate = run(home.path(), &["config", "model", "set", "owner/other"]);
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("update"));
+    let update = run(home.path(), &["config", "model", "update", "owner/other"]);
+    assert!(
+        update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+    let updated = fs::read_to_string(&path).expect("config should be readable");
+    assert!(updated.contains("model = \"owner/other\""));
+    assert!(updated.contains("# Keep this comment") && updated.contains("other = 42"));
+    let unset = run(home.path(), &["config", "model", "unset"]);
+    assert!(unset.status.success());
+    let remaining = fs::read_to_string(&path).expect("config should be readable");
+    assert!(!remaining.contains("model ="));
+    assert!(remaining.contains("# Keep this comment") && remaining.contains("other = 42"));
+}
+
+fn set_with_response(home: &Path, answer: &str, endpoint: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lai"))
+        .args(["config", "model", "set", "owner/model"])
+        .current_dir(home)
+        .env("HOME", home)
+        .env("HF_ENDPOINT", endpoint)
+        .env("HF_TOKEN", "test-token")
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("CLI should start");
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(answer.as_bytes())
+            .expect("answer should be sent");
+    }
+    child.wait_with_output().expect("CLI should finish")
+}
+
+#[test]
+fn missing_model_warns_and_can_be_selected_without_download() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = set_with_response(home.path(), "n\n", "http://127.0.0.1:1");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("WARN")
+            && stderr.contains("not installed")
+            && stderr.contains("Download this model now?"),
+        "{stderr}"
+    );
+    assert!(
+        fs::read_to_string(home.path().join(".lai/config.toml"))
+            .expect("config should exist")
+            .contains("owner/model")
+    );
+}
+
+#[test]
+fn missing_model_can_be_downloaded_before_selection() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let server = TcpListener::bind("127.0.0.1:0").expect("mock server should bind");
+    let endpoint = format!(
+        "http://{}",
+        server.local_addr().expect("server should have address")
+    );
+    let handle = thread::spawn(move || {
+        for index in 0..2 {
+            let (mut stream, _) = server.accept().expect("request should arrive");
+            let mut request = [0; 4096];
+            stream
+                .read(&mut request)
+                .expect("request should be readable");
+            let body = if index == 0 {
+                r#"{"sha":"0123456789012345678901234567890123456789","tags":["mlx"],"siblings":[{"rfilename":"model.safetensors"}]}"#
+            } else {
+                "model data"
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("response should be sent");
+        }
+    });
+    let output = set_with_response(home.path(), "y\n", &endpoint);
+    handle.join().expect("mock server should finish");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(
+            home.path()
+                .join(".lai/models/owner/model/model.safetensors")
+        )
+        .expect("model should be downloaded"),
+        b"model data"
+    );
+    assert!(home.path().join(".lai/config.toml").exists());
+}
+
+#[test]
+fn missing_model_without_response_does_not_save_selection() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = set_with_response(home.path(), "", "http://127.0.0.1:1");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no response"));
+    assert!(!home.path().join(".lai/config.toml").exists());
+}
+
+#[test]
+fn failed_download_does_not_save_selection() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let output = set_with_response(home.path(), "y\n", "invalid-url");
+    assert!(!output.status.success());
+    assert!(!home.path().join(".lai/config.toml").exists());
+}
+
+#[test]
+fn rejects_missing_selection_and_invalid_model_without_creating_config() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    for args in [
+        vec!["config", "model", "update", "owner/model"],
+        vec!["config", "model", "unset"],
+        vec!["config", "model", "set", "../bad"],
+    ] {
+        let output = run(home.path(), &args);
+        assert!(!output.status.success());
+    }
+    assert!(!home.path().join(".lai/config.toml").exists());
+}
+
+#[test]
+fn malformed_config_is_not_overwritten() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let directory = home.path().join(".lai");
+    fs::create_dir(&directory).expect("config directory should be created");
+    let path = directory.join("config.toml");
+    fs::write(&path, "model = [\n").expect("fixture should be written");
+    let output = run(home.path(), &["config", "model", "set", "owner/model"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("fix the file"));
+    assert_eq!(
+        fs::read_to_string(path).expect("config should be readable"),
+        "model = [\n"
+    );
+}
