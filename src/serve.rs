@@ -16,7 +16,8 @@ use anyhow::{Context, ensure};
 use safemlx::{Device, DeviceType, ExecutionContext};
 #[cfg(target_os = "macos")]
 use safemlx_lm::models::{
-    LoadedModel,
+    LoadedModel, Model,
+    gemma4_assistant::{Gemma4AssistantDraftModel, load_gemma4_assistant_model},
     input::{InputPart, ModelInput},
 };
 #[cfg(target_os = "macos")]
@@ -32,10 +33,21 @@ pub fn run(detached: bool, port: u16, ready_signal: bool) -> anyhow::Result<()> 
         "port must be between 1 and 65535; choose a port with --port"
     );
     let (model_id, model_path) = crate::model::selected_model()?;
+    let draft = crate::model::selected_draft()?;
     if detached {
         return start_detached(port);
     }
-    run_server(&model_id, &model_path, port, ready_signal)
+    run_server(&model_id, &model_path, draft.as_ref(), port, ready_signal)
+}
+
+#[cfg(target_os = "macos")]
+pub fn kill() -> anyhow::Result<()> {
+    crate::server_control::stop()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn kill() -> anyhow::Result<()> {
+    anyhow::bail!("Detached server management requires macOS")
 }
 
 #[cfg(target_os = "macos")]
@@ -104,6 +116,7 @@ fn start_detached(_: u16) -> anyhow::Result<()> {
 fn run_server(
     model_id: &str,
     model_path: &std::path::Path,
+    draft: Option<&(String, std::path::PathBuf)>,
     port: u16,
     ready_signal: bool,
 ) -> anyhow::Result<()> {
@@ -111,6 +124,11 @@ fn run_server(
         cfg!(target_arch = "aarch64"),
         "MLX inference requires an Apple Silicon Mac"
     );
+    let mut control = if ready_signal {
+        Some(crate::server_control::Control::acquire()?)
+    } else {
+        None
+    };
     let server = Server::http(("127.0.0.1", port)).map_err(|error| {
         anyhow::anyhow!(
             "cannot listen on 127.0.0.1:{port}: {error}; choose another port with --port"
@@ -122,21 +140,73 @@ fn run_server(
     log::info!("Loading {model_id} from {}...", model_path.display());
     let mut model = LoadedModel::load(model_path, stream, weights_context.stream())
         .with_context(|| format!("cannot load model {model_id}; verify it is a supported MLX model and download it again if incomplete"))?;
+    let mut assistant = if let Some((draft_id, draft_path)) = draft {
+        let target = match model.model_mut() {
+            Model::Gemma4(target) => target,
+            _ => anyhow::bail!(
+                "speculative decoding currently supports Gemma 4 models only; disable it with `lai model speculativeDecoding false`"
+            ),
+        };
+        log::info!(
+            "Loading speculative draft model {draft_id} from {}...",
+            draft_path.display()
+        );
+        let assistant = load_gemma4_assistant_model(draft_path, stream, weights_context.stream())
+            .with_context(|| {
+            format!(
+                "cannot load draft model {draft_id}; use a compatible unquantized Gemma 4 assistant"
+            )
+        })?;
+        let draft_args = &assistant.config.text_config;
+        let target_args = &target.args;
+        ensure!(
+            assistant.config.model_type == "gemma4_assistant"
+                && assistant.config.backbone_hidden_size == target_args.hidden_size
+                && draft_args.vocab_size == target_args.vocab_size
+                && draft_args.num_key_value_heads == target_args.num_key_value_heads
+                && draft_args.head_dim == target_args.head_dim
+                && draft_args.global_head_dim == target_args.global_head_dim,
+            "draft model {draft_id} is incompatible with {model_id}; choose a compatible Gemma 4 assistant"
+        );
+        log::info!("Speculative decoding enabled using {draft_id}");
+        Some(assistant)
+    } else {
+        None
+    };
     log::info!("Serving {model_id} at http://127.0.0.1:{port}/v1");
+    let stop_requested = match &mut control {
+        Some(control) => Some(control.start()?),
+        None => None,
+    };
     if ready_signal {
         println!("ready");
         std::io::stdout()
             .flush()
             .context("cannot report server startup")?;
     }
-    for request in server.incoming_requests() {
-        handle_request(request, model_id, &mut model, stream);
+    loop {
+        if stop_requested
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            log::info!("Stopping detached LAI server");
+            break;
+        }
+        if let Some(request) = server.recv_timeout(std::time::Duration::from_millis(250))? {
+            handle_request(request, model_id, &mut model, &mut assistant, stream);
+        }
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn run_server(_: &str, _: &std::path::Path, _: u16, _: bool) -> anyhow::Result<()> {
+fn run_server(
+    _: &str,
+    _: &std::path::Path,
+    _: Option<&(String, std::path::PathBuf)>,
+    _: u16,
+    _: bool,
+) -> anyhow::Result<()> {
     anyhow::bail!("MLX inference requires Apple Silicon and macOS")
 }
 
@@ -176,10 +246,12 @@ struct CompletionRequest {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::manual_unwrap_or)] // Defaults are intentional for optional API fields.
 fn handle_request(
     mut request: tiny_http::Request,
     model_id: &str,
     model: &mut LoadedModel,
+    assistant: &mut Option<Gemma4AssistantDraftModel>,
     stream: &safemlx::Stream,
 ) {
     if request.method() == &Method::Get && request.url() == "/v1/models" {
@@ -212,7 +284,7 @@ fn handle_request(
         return;
     }
     if completion {
-        handle_completion(request, &body, model_id, model, stream);
+        handle_completion(request, &body, model_id, model, assistant, stream);
         return;
     }
     let input: ChatRequest = match serde_json::from_slice(&body) {
@@ -241,7 +313,13 @@ fn handle_request(
     }
     let temperature = match input.temperature {
         Some(value) => value,
-        None => 1.0,
+        None => {
+            if assistant.is_some() {
+                0.0
+            } else {
+                1.0
+            }
+        }
     };
     let max_tokens = match input.max_completion_tokens.or(input.max_tokens) {
         Some(value) => value,
@@ -258,7 +336,24 @@ fn handle_request(
         );
         return;
     }
-    match generate(model, stream, &input.messages, temperature, max_tokens) {
+    if assistant.is_some() && temperature != 0.0 {
+        respond_error(
+            request,
+            400,
+            "speculative decoding currently requires temperature 0; set temperature to 0 or disable it with `lai model speculativeDecoding false`",
+        );
+        return;
+    }
+    match log_inference("/v1/chat/completions", model_id, || {
+        generate(
+            model,
+            assistant,
+            stream,
+            &input.messages,
+            temperature,
+            max_tokens,
+        )
+    }) {
         Ok((text, prompt_tokens, completion_tokens, finish)) => {
             let created = unix_time();
             let id = format!(
@@ -280,8 +375,7 @@ fn handle_request(
                 );
             }
         }
-        Err(error) => {
-            log::error!("Inference failed: {error:#}");
+        Err(_) => {
             respond_error(
                 request,
                 500,
@@ -292,11 +386,13 @@ fn handle_request(
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::manual_unwrap_or)] // Defaults are intentional for optional API fields.
 fn handle_completion(
     request: tiny_http::Request,
     body: &[u8],
     model_id: &str,
     model: &mut LoadedModel,
+    assistant: &mut Option<Gemma4AssistantDraftModel>,
     stream: &safemlx::Stream,
 ) {
     let input: CompletionRequest = match serde_json::from_slice(body) {
@@ -312,7 +408,13 @@ fn handle_completion(
     }
     let temperature = match input.temperature {
         Some(value) => value,
-        None => 1.0,
+        None => {
+            if assistant.is_some() {
+                0.0
+            } else {
+                1.0
+            }
+        }
     };
     let max_tokens = match input.max_tokens {
         Some(value) => value,
@@ -330,7 +432,24 @@ fn handle_completion(
         );
         return;
     }
-    match generate_text(model, stream, &input.prompt, temperature, max_tokens) {
+    if assistant.is_some() && temperature != 0.0 {
+        respond_error(
+            request,
+            400,
+            "speculative decoding currently requires temperature 0; set temperature to 0 or disable it with `lai model speculativeDecoding false`",
+        );
+        return;
+    }
+    match log_inference("/v1/completions", model_id, || {
+        generate_text(
+            model,
+            assistant,
+            stream,
+            &input.prompt,
+            temperature,
+            max_tokens,
+        )
+    }) {
         Ok((text, prompt_tokens, completion_tokens, finish)) => {
             let created = unix_time();
             let id = format!(
@@ -355,8 +474,7 @@ fn handle_completion(
                 );
             }
         }
-        Err(error) => {
-            log::error!("Inference failed: {error:#}");
+        Err(_) => {
             respond_error(
                 request,
                 500,
@@ -367,8 +485,31 @@ fn handle_completion(
 }
 
 #[cfg(target_os = "macos")]
+fn log_inference(
+    endpoint: &str,
+    model_id: &str,
+    generate: impl FnOnce() -> anyhow::Result<(String, usize, usize, &'static str)>,
+) -> anyhow::Result<(String, usize, usize, &'static str)> {
+    log::info!("Starting inference for {endpoint} with model {model_id}");
+    let started = std::time::Instant::now();
+    let result = generate();
+    match &result {
+        Ok((_, prompt_tokens, completion_tokens, finish)) => log::info!(
+            "Finished inference for {endpoint} with model {model_id} in {:.2}s (prompt tokens: {prompt_tokens}, completion tokens: {completion_tokens}, finish: {finish})",
+            started.elapsed().as_secs_f64()
+        ),
+        Err(error) => log::error!(
+            "Inference failed for {endpoint} with model {model_id} after {:.2}s: {error:#}",
+            started.elapsed().as_secs_f64()
+        ),
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
 fn generate(
     model: &mut LoadedModel,
+    assistant: &mut Option<Gemma4AssistantDraftModel>,
     stream: &safemlx::Stream,
     messages: &[Message],
     temperature: f32,
@@ -382,12 +523,13 @@ fn generate(
     let prompt = model
         .apply_chat_template_json(vec![messages], None, true)?
         .context("model has no chat template; use a model with a tokenizer chat template")?;
-    generate_text(model, stream, &prompt, temperature, max_tokens)
+    generate_text(model, assistant, stream, &prompt, temperature, max_tokens)
 }
 
 #[cfg(target_os = "macos")]
 fn generate_text(
     model: &mut LoadedModel,
+    assistant: &mut Option<Gemma4AssistantDraftModel>,
     stream: &safemlx::Stream,
     prompt: &str,
     temperature: f32,
@@ -396,6 +538,39 @@ fn generate_text(
     let prompt_ids = model.encode(prompt, false)?;
     let tokens = model.encode_to_array(prompt, false, stream)?;
     let eos = model.eos_token_ids().to_vec();
+    if let Some(assistant) = assistant {
+        let target = match model.model_mut() {
+            Model::Gemma4(target) => target,
+            _ => anyhow::bail!("speculative decoding requires a Gemma 4 target"),
+        };
+        let (generated, stats) = safemlx_lm::gemma4_mtp::generate_gemma4_mtp(
+            target,
+            assistant,
+            &tokens,
+            &eos,
+            max_tokens,
+            temperature,
+            None,
+            stream,
+        )?;
+        log::info!(
+            "Speculative decoding: accepted {} of {} draft tokens in {} rounds",
+            stats.accepted_tokens,
+            stats.draft_tokens,
+            stats.rounds
+        );
+        let finish = if generated.len() < max_tokens {
+            "stop"
+        } else {
+            "length"
+        };
+        return Ok((
+            model.decode(&generated, true)?,
+            prompt_ids.len(),
+            generated.len(),
+            finish,
+        ));
+    }
     let mut cache = model.new_cache();
     let key = if temperature == 0.0 {
         None

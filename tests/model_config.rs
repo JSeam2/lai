@@ -121,9 +121,10 @@ fn missing_model_can_be_downloaded_before_selection() {
         for index in 0..2 {
             let (mut stream, _) = server.accept().expect("request should arrive");
             let mut request = [0; 4096];
-            stream
+            let bytes_read = stream
                 .read(&mut request)
                 .expect("request should be readable");
+            assert!(bytes_read > 0, "request should not be empty");
             let body = if index == 0 {
                 r#"{"sha":"0123456789012345678901234567890123456789","tags":["mlx"],"siblings":[{"rfilename":"model.safetensors"}]}"#
             } else {
@@ -201,4 +202,61 @@ fn malformed_config_is_not_overwritten() {
         fs::read_to_string(path).expect("config should be readable"),
         "model = [\n"
     );
+}
+
+#[test]
+fn can_enable_and_disable_speculative_decoding() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let directory = home.path().join(".lai");
+    fs::create_dir_all(directory.join("models/owner/draft")).expect("draft directory should exist");
+    fs::write(directory.join("config.toml"), "model = \"owner/target\"\n")
+        .expect("config should be written");
+    let output = run(
+        home.path(),
+        &[
+            "model",
+            "speculativeDecoding",
+            "true",
+            "--draft-model",
+            "owner/draft",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let contents = fs::read_to_string(directory.join("config.toml")).expect("config should exist");
+    assert!(
+        contents.contains("model = \"owner/target\"")
+            && contents.contains("draft_model = \"owner/draft\"")
+            && contents.contains("speculative_decoding = true")
+    );
+    let output = run(home.path(), &["model", "speculativeDecoding", "false"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let contents = fs::read_to_string(directory.join("config.toml")).expect("config should exist");
+    assert!(
+        contents.contains("model = \"owner/target\"")
+            && contents.contains("speculative_decoding = false")
+    );
+}
+
+#[test]
+fn missing_speculative_draft_model_has_actionable_error_on_serve() {
+    let home = tempfile::tempdir().expect("temporary home should be created");
+    let directory = home.path().join(".lai");
+    fs::create_dir_all(directory.join("models/owner/target"))
+        .expect("target directory should exist");
+    fs::write(
+        directory.join("config.toml"),
+        "model = \"owner/target\"\ndraft_model = \"owner/draft\"\nspeculative_decoding = true\n",
+    )
+    .expect("config should be written");
+    let output = run(home.path(), &["serve"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("lai download owner/draft"));
 }

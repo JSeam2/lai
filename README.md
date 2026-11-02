@@ -1,31 +1,35 @@
 # LAI - Local AI
 LAI is an opinionated local agent harness on Apple Silicon for developers who are tired of being cucked by the AI overlords.
 
-## Advanced Quickstart
+## Developer Quickstart
 
 1. [Install Rust](https://rust-lang.org/tools/install/) 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-1. Install Xcode and Metal toolchain if not already installed
+1. Install dev dependencies, Xcode, and Metal toolchain if not already installed
 ```
 xcode-select --install
 xcodebuild -runFirstLaunch
 xcodebuild -downloadComponent MetalToolchain
+
+brew update
+brew install cmake
+
 ```
 
-2. Build
+1. Build
 ```sh
 cargo build --release
 ```
 
-3. Test
+1. Test
 ```sh
 cargo nextest run
 ```
 
-3. Download a `mlx` friendly HuggingFace model. This model will be saved under `~/.lai/models/<owner>/<model>/`.
+1. Download a `mlx` friendly HuggingFace model. This model will be saved under `~/.lai/models/<owner>/<model>/`.
 Models may not run if they're not `mlx` compatible. 
 You may also need to set a huggingface token for private models on huggingface.
 
@@ -34,7 +38,7 @@ lai key set huggingface
 lai download "DreamFoundries/supergemma4-e4b-abliterated-6bit"
 ```
 
-4. Test out the model by setting it and chatting with it
+1. Test out the model by setting it and chatting with it
 ```sh
 lai config model "DreamFoundries/supergemma4-e4b-abliterated-6bit"
 lai chat
@@ -80,15 +84,43 @@ Building the MLX backend requires CMake, Xcode with the Metal toolchain, and an 
 ```sh
 lai serve                 # foreground, Ctrl-C to stop
 lai serve -d              # background; logs go to ~/.lai/serve.log
-lai serve --port 8081     # choose a different local port
+lai serve --port 8081     # choose a different local port  (default: 8989)
+lai kill                  # kill an existing lai serving in the background
 ```
 
-The server listens only on `127.0.0.1`, with default base URL `http://127.0.0.1:8080/v1`. Detached startup waits for the model to load and reports the process ID; stop it with `kill <PID>`. The API exposes `GET /v1/models`, `POST /v1/chat/completions`, and `POST /v1/completions`. Use the configured Hugging Face model ID in the `model` field:
+`lai kill` asks the detached server to stop after its current request finishes. It does not stop a foreground server. A detached server started by an older LAI version must first be stopped using the PID logged at startup.
 
+The server listens only on `127.0.0.1`, with default base URL `http://127.0.0.1:8989/v1`. 
+
+The API exposes `GET /v1/models`, `POST /v1/chat/completions`, and `POST /v1/completions`. 
+
+Use the configured Hugging Face model ID in the `model` field:
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"DreamFoundries/supergemma4-e4b-abliterated-6bit","messages":[{"role":"user","content":"Hello!"}],"max_tokens":128}'
 ```
 
-This initial API supports text messages, temperature, and token limits, with one completion per request. Streaming responses use the OpenAI event format but are buffered until generation finishes. Unsupported request fields are rejected; tools, multimodal input, and concurrent generation are not yet supported.
+A helper script is in `./script/completion.sh` to test out the flow.
+If `jq` is missing, the script installs it using Homebrew.
+```sh
+./script/completion.sh "Hello!"
+```
+
+The script discovers the loaded model automatically. Set `LAI_BASE_URL` if the server uses a different address, for example `LAI_BASE_URL=http://127.0.0.1:8081/v1 ./script/completion.sh "Hello!"`.
+
+### Speculative decoding
+
+For a compatible Gemma 4 model, enable speculative decoding with:
+
+```sh
+lai model speculativeDecoding true
+```
+
+LAI stores the setting in `~/.lai/config.toml` and offers to download the Gemma 4 E4B assistant if needed. To use a different compatible, unquantized Gemma 4 assistant, supply `--draft-model owner/model` when enabling it. Restart `lai serve` after changing the setting. Disable it with:
+
+```sh
+lai model speculativeDecoding false
+```
+
+The draft model uses additional memory, and performance depends on the model and workload. The server logs the number of accepted draft tokens. Speculative decoding currently supports greedy generation only: omit `temperature` or set it to `0`; requests specifying a different temperature are rejected. When disabled, the server uses normal decoding.

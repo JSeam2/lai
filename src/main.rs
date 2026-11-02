@@ -4,6 +4,8 @@ mod download;
 mod key;
 mod model;
 mod serve;
+#[cfg(target_os = "macos")]
+mod server_control;
 
 use clap::Parser;
 

@@ -9,13 +9,15 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Stop the detached LAI server
+    Kill,
     /// Serve the configured model through an OpenAI-compatible API
     Serve {
         /// Run the server in the background
         #[arg(short, long)]
         detached: bool,
         /// Local port to listen on
-        #[arg(long, default_value_t = 8080)]
+        #[arg(long, default_value_t = 8989)]
         port: u16,
         #[arg(long, hide = true)]
         ready_signal: bool,
@@ -34,6 +36,25 @@ pub enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Configure model inference
+    Model {
+        #[command(subcommand)]
+        command: InferenceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum InferenceCommand {
+    /// Enable or disable speculative decoding
+    #[command(name = "speculativeDecoding")]
+    SpeculativeDecoding {
+        /// Whether speculative decoding is enabled: true or false
+        #[arg(action = clap::ArgAction::Set)]
+        enabled: bool,
+        /// Hugging Face ID of the draft model (defaults to the Gemma 4 E4B assistant)
+        #[arg(long)]
+        draft_model: Option<String>,
     },
 }
 

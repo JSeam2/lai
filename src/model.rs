@@ -12,6 +12,105 @@ use crate::{
     download::{self, validate_model_id},
 };
 
+const DEFAULT_DRAFT_MODEL: &str = "mlx-community/gemma-4-E4B-it-assistant-bf16";
+
+pub fn selected_draft() -> anyhow::Result<Option<(String, PathBuf)>> {
+    let home = env::var_os("HOME").context("HOME is not set; set it to your home directory")?;
+    let root = PathBuf::from(home).join(".lai");
+    let path = root.join("config.toml");
+    let config = fs::read_to_string(&path)?
+        .parse::<DocumentMut>()
+        .with_context(|| {
+            format!(
+                "{} is not valid TOML; fix the configuration",
+                path.display()
+            )
+        })?;
+    let enabled = match config.get("speculative_decoding") {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .context("speculative_decoding must be true or false in config.toml")?,
+    };
+    if !enabled {
+        return Ok(None);
+    }
+    let draft = match config.get("draft_model") {
+        None => DEFAULT_DRAFT_MODEL,
+        Some(value) => value
+            .as_str()
+            .context("draft_model must be a Hugging Face model ID in config.toml")?,
+    };
+    validate_model_id(draft)?;
+    let model_path = root.join("models").join(draft);
+    ensure!(
+        model_path.is_dir(),
+        "draft model {draft} is not installed at {}; run `lai download {draft}` or disable speculative decoding with `lai model speculativeDecoding false`",
+        model_path.display()
+    );
+    Ok(Some((draft.to_owned(), model_path)))
+}
+
+pub fn set_speculative(enabled: bool, draft_model: Option<String>) -> anyhow::Result<()> {
+    ensure!(
+        enabled || draft_model.is_none(),
+        "--draft-model can only be used when enabling speculative decoding"
+    );
+    let home = env::var_os("HOME").context("HOME is not set; set it to your home directory")?;
+    let directory = PathBuf::from(home).join(".lai");
+    let path = directory.join("config.toml");
+    let contents = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "cannot read {}; select a model using `lai config model set <MODEL>`",
+            path.display()
+        )
+    })?;
+    let mut config = contents.parse::<DocumentMut>().with_context(|| {
+        format!(
+            "{} is not valid TOML; fix the file before changing settings",
+            path.display()
+        )
+    })?;
+    ensure!(
+        config.get("model").and_then(|item| item.as_str()).is_some(),
+        "no model is configured; use `lai config model set <MODEL>` first"
+    );
+    if enabled {
+        let draft = match draft_model {
+            Some(model) => model,
+            None => match config.get("draft_model") {
+                Some(item) => item
+                    .as_str()
+                    .context("draft_model must be a model ID in config.toml")?
+                    .to_owned(),
+                None => DEFAULT_DRAFT_MODEL.to_owned(),
+            },
+        };
+        validate_model_id(&draft)?;
+        let draft_path = directory.join("models").join(&draft);
+        if !draft_path.is_dir() {
+            log::warn!(
+                "Draft model {draft} is not installed at {}.",
+                draft_path.display()
+            );
+            ensure!(
+                prompt_download()?,
+                "speculative decoding was not enabled; download {draft} and try again"
+            );
+            download::download(&draft)?;
+        }
+        config["draft_model"] = value(draft);
+    }
+    config["speculative_decoding"] = value(enabled);
+    save(&directory, &path, &config)?;
+    log::info!(
+        "Speculative decoding {} in {}",
+        if enabled { "enabled" } else { "disabled" },
+        path.display()
+    );
+    Ok(())
+}
+
 pub fn selected_model() -> anyhow::Result<(String, PathBuf)> {
     let home = env::var_os("HOME")
         .context("HOME is not set; set it to your home directory before starting LAI")?;
@@ -43,6 +142,7 @@ pub fn selected_model() -> anyhow::Result<(String, PathBuf)> {
     Ok((model.to_owned(), model_path))
 }
 
+#[allow(clippy::manual_unwrap_or_default, clippy::manual_unwrap_or)] // Explicit defaults keep error handling visible.
 pub fn run(action: ModelAction) -> anyhow::Result<()> {
     let home = env::var_os("HOME")
         .context("HOME is not set; set it to your home directory before configuring a model")?;
