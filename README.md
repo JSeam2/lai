@@ -1,4 +1,7 @@
 # LAI - Local AI
+
+![LAI](docs/lai.png)
+
 LAI is an opinionated local agent harness on Apple Silicon for developers who are tired of being cucked by the AI overlords.
 
 ## Developer Quickstart
