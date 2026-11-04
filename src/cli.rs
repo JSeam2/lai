@@ -35,6 +35,11 @@ pub enum Command {
         #[command(subcommand)]
         action: KeyAction,
     },
+    /// Inspect and manage saved memories
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
     /// Manage LAI configuration
     Config {
         #[command(subcommand)]
@@ -61,6 +66,17 @@ pub enum ConfigCommand {
     Model {
         #[command(subcommand)]
         action: ModelAction,
+    },
+    /// Manage the memory embedding model
+    #[command(name = "modelMemory")]
+    ModelMemory {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+    /// Configure persistent memory
+    Memory {
+        #[command(subcommand)]
+        action: MemoryConfigAction,
     },
     /// Configure the desktop pet
     Pet {
@@ -160,4 +176,27 @@ pub enum KeyAction {
 #[derive(Clone, Copy, ValueEnum)]
 pub enum Provider {
     Huggingface,
+}
+
+#[derive(Subcommand)]
+pub enum MemoryAction {
+    /// List saved memories
+    List,
+    /// Show a memory and its source
+    Show { id: i64 },
+    /// Delete a saved memory
+    Delete { id: i64 },
+    /// Clear saved memories and queued jobs
+    Clear,
+}
+
+#[derive(Subcommand)]
+pub enum MemoryConfigAction {
+    /// Enable or disable persistent memory
+    Enabled {
+        #[arg(action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
+    /// Select a SQLite filename under ~/.lai/memories
+    Profile { filename: String },
 }

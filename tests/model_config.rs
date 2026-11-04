@@ -313,3 +313,104 @@ fn missing_speculative_draft_model_has_actionable_error_on_serve() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("lai download owner/draft"));
 }
+
+#[test]
+fn memory_model_set_update_unset_preserves_primary_model() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join(".lai");
+    fs::create_dir_all(root.join("models/mlx-community/embeddinggemma-2-5bit")).unwrap();
+    fs::write(
+        root.join("config.toml"),
+        "# Keep this\nmodel = \"owner/chat\"\nother = 42\n",
+    )
+    .unwrap();
+    let model = "mlx-community/embeddinggemma-2-5bit";
+    let set = run(home.path(), &["config", "modelMemory", "set", model]);
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let contents = fs::read_to_string(root.join("config.toml")).unwrap();
+    assert!(contents.contains("model_memory = \"mlx-community/embeddinggemma-2-5bit\""));
+    assert!(contents.contains("model = \"owner/chat\""));
+    let duplicate = run(home.path(), &["config", "modelMemory", "set", model]);
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("modelMemory update"));
+    let update = run(
+        home.path(),
+        &["config", "modelMemory", "update", "owner/new-embedding"],
+    );
+    assert!(
+        update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+    let contents = fs::read_to_string(root.join("config.toml")).unwrap();
+    assert!(contents.contains("model_memory = \"owner/new-embedding\""));
+    let unset = run(home.path(), &["config", "modelMemory", "unset"]);
+    assert!(
+        unset.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unset.stderr)
+    );
+    let contents = fs::read_to_string(root.join("config.toml")).unwrap();
+    assert!(!contents.contains("model_memory"));
+    assert!(
+        contents.contains("model = \"owner/chat\"")
+            && contents.contains("# Keep this")
+            && contents.contains("other = 42")
+    );
+}
+
+#[test]
+fn memory_model_rejects_missing_selection_invalid_ids_and_bad_configuration() {
+    let home = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["config", "modelMemory", "update", "owner/model"],
+        vec!["config", "modelMemory", "unset"],
+        vec!["config", "modelMemory", "set", "../bad"],
+    ] {
+        assert!(!run(home.path(), &args).status.success());
+    }
+    assert!(!home.path().join(".lai/config.toml").exists());
+    let root = home.path().join(".lai");
+    fs::create_dir_all(&root).unwrap();
+    for contents in ["model_memory = [\n", "model_memory = 42\n"] {
+        fs::write(root.join("config.toml"), contents).unwrap();
+        assert!(
+            !run(home.path(), &["config", "modelMemory", "unset"])
+                .status
+                .success()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("config.toml")).unwrap(),
+            contents
+        );
+    }
+}
+
+#[test]
+fn memory_model_can_be_selected_without_downloading() {
+    let home = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lai"))
+        .env("HOME", home.path())
+        .args(["config", "modelMemory", "set", "owner/embedding"])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"n\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Download this model now?"));
+    assert!(
+        fs::read_to_string(home.path().join(".lai/config.toml"))
+            .unwrap()
+            .contains("model_memory = \"owner/embedding\"")
+    );
+}

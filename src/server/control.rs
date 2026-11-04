@@ -1,5 +1,4 @@
 use std::{
-    env,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Write},
     os::unix::{
@@ -18,11 +17,6 @@ use std::{
 
 use anyhow::{Context, ensure};
 
-fn directory() -> anyhow::Result<PathBuf> {
-    let home = env::var_os("HOME").context("HOME is not set; set it to your home directory")?;
-    Ok(PathBuf::from(home).join(".lai"))
-}
-
 pub struct Control {
     _lock: File,
     socket_path: PathBuf,
@@ -31,7 +25,7 @@ pub struct Control {
 
 impl Control {
     pub fn acquire() -> anyhow::Result<Self> {
-        let dir = directory()?;
+        let dir = lai::root()?;
         fs::create_dir_all(&dir)
             .with_context(|| format!("cannot create {}; check permissions", dir.display()))?;
         let lock = OpenOptions::new()
@@ -133,7 +127,7 @@ impl Drop for Control {
 }
 
 pub fn stop() -> anyhow::Result<()> {
-    let path = directory()?.join("serve.sock");
+    let path = lai::root()?.join("serve.sock");
     let mut stream = UnixStream::connect(&path).with_context(|| {
         format!(
             "no detached LAI server is reachable at {}; start one with `lai serve -d`",

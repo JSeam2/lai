@@ -17,6 +17,10 @@ impl AssetStore {
             "/" => Some(("text/html", include_bytes!("../../assets/pet/index.html"))),
             "/pet.css" => Some(("text/css", include_bytes!("../../assets/pet/pet.css"))),
             "/pet.js" => Some(("text/javascript", include_bytes!("../../assets/pet/pet.js"))),
+            "/toon.js" => Some((
+                "text/javascript",
+                include_bytes!("../../assets/pet/toon.js"),
+            )),
             "/vendor/three.module.js" => Some((
                 "text/javascript",
                 include_bytes!("../../assets/pet/vendor/three.module.js"),

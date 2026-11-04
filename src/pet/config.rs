@@ -38,8 +38,7 @@ impl Default for Animations {
 }
 
 fn config_path() -> anyhow::Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set; cannot locate config.toml")?;
-    Ok(Path::new(&home).join(".lai/config.toml"))
+    Ok(lai::root()?.join("config.toml"))
 }
 
 fn document(path: &Path) -> anyhow::Result<DocumentMut> {

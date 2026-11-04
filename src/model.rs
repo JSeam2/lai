@@ -1,5 +1,5 @@
 use std::{
-    env, fs,
+    fs,
     io::{self, Write},
     path::PathBuf,
 };
@@ -15,8 +15,7 @@ use crate::{
 const DEFAULT_DRAFT_MODEL: &str = "mlx-community/gemma-4-E4B-it-assistant-bf16";
 
 pub fn set_system_prompt(prompt: &str) -> anyhow::Result<()> {
-    let home = env::var_os("HOME").context("HOME is not set; set it to your home directory")?;
-    let directory = PathBuf::from(home).join(".lai");
+    let directory = lai::root()?;
     let path = directory.join("config.toml");
     let mut config = match fs::read_to_string(&path) {
         Ok(contents) => contents.parse::<DocumentMut>().with_context(|| {
@@ -48,8 +47,7 @@ pub fn set_system_prompt(prompt: &str) -> anyhow::Result<()> {
 
 #[cfg(target_os = "macos")]
 pub fn system_prompt() -> anyhow::Result<Option<String>> {
-    let home = env::var_os("HOME").context("HOME is not set; set it to your home directory")?;
-    let path = PathBuf::from(home).join(".lai/config.toml");
+    let path = lai::root()?.join("config.toml");
     let config = fs::read_to_string(&path)?
         .parse::<DocumentMut>()
         .with_context(|| format!("{} is not valid TOML", path.display()))?;
@@ -65,8 +63,7 @@ pub fn system_prompt() -> anyhow::Result<Option<String>> {
 }
 
 pub fn selected_draft() -> anyhow::Result<Option<(String, PathBuf)>> {
-    let home = env::var_os("HOME").context("HOME is not set; set it to your home directory")?;
-    let root = PathBuf::from(home).join(".lai");
+    let root = lai::root()?;
     let path = root.join("config.toml");
     let config = fs::read_to_string(&path)?
         .parse::<DocumentMut>()
@@ -106,8 +103,7 @@ pub fn set_speculative(enabled: bool, draft_model: Option<String>) -> anyhow::Re
         enabled || draft_model.is_none(),
         "--draft-model can only be used when enabling speculative decoding"
     );
-    let home = env::var_os("HOME").context("HOME is not set; set it to your home directory")?;
-    let directory = PathBuf::from(home).join(".lai");
+    let directory = lai::root()?;
     let path = directory.join("config.toml");
     let contents = fs::read_to_string(&path).with_context(|| {
         format!(
@@ -162,9 +158,7 @@ pub fn set_speculative(enabled: bool, draft_model: Option<String>) -> anyhow::Re
 }
 
 pub fn selected_model() -> anyhow::Result<(String, PathBuf)> {
-    let home = env::var_os("HOME")
-        .context("HOME is not set; set it to your home directory before starting LAI")?;
-    let root = PathBuf::from(home).join(".lai");
+    let root = lai::root()?;
     let path = root.join("config.toml");
     let contents = fs::read_to_string(&path).with_context(|| {
         format!(
@@ -192,11 +186,18 @@ pub fn selected_model() -> anyhow::Result<(String, PathBuf)> {
     Ok((model.to_owned(), model_path))
 }
 
+pub enum ModelKind {
+    Chat,
+    Memory,
+}
+
 #[allow(clippy::manual_unwrap_or_default, clippy::manual_unwrap_or)] // Explicit defaults keep error handling visible.
-pub fn run(action: ModelAction) -> anyhow::Result<()> {
-    let home = env::var_os("HOME")
-        .context("HOME is not set; set it to your home directory before configuring a model")?;
-    let directory = PathBuf::from(home).join(".lai");
+pub fn run(action: ModelAction, kind: ModelKind) -> anyhow::Result<()> {
+    let (key, command, label) = match kind {
+        ModelKind::Chat => ("model", "model", "model"),
+        ModelKind::Memory => ("model_memory", "modelMemory", "memory model"),
+    };
+    let directory = lai::root()?;
     let path = directory.join("config.toml");
     let mut config = match fs::read_to_string(&path) {
         Ok(contents) => contents.parse::<DocumentMut>().with_context(|| {
@@ -211,10 +212,10 @@ pub fn run(action: ModelAction) -> anyhow::Result<()> {
                 .with_context(|| format!("cannot read {}; check its permissions", path.display()));
         }
     };
-    if let Some(existing) = config.get("model") {
+    if let Some(existing) = config.get(key) {
         ensure!(
             existing.as_str().is_some(),
-            "the model in {} must be a string; fix the configuration before continuing",
+            "the {label} in {} must be a string; fix the configuration before continuing",
             path.display()
         );
     }
@@ -222,8 +223,8 @@ pub fn run(action: ModelAction) -> anyhow::Result<()> {
         ModelAction::Set { model } => {
             validate_model_id(&model)?;
             ensure!(
-                !config.contains_key("model"),
-                "a model is already configured; use `lai config model update <MODEL>` to change it"
+                !config.contains_key(key),
+                "a {label} is already configured; use `lai config {command} update <MODEL>` to change it"
             );
             let model_path = directory.join("models").join(&model);
             match fs::metadata(&model_path) {
@@ -250,32 +251,32 @@ pub fn run(action: ModelAction) -> anyhow::Result<()> {
                     });
                 }
             }
-            config["model"] = value(&model);
+            config[key] = value(&model);
             save(&directory, &path, &config)?;
-            log::info!("Selected model {model} in {}", path.display());
+            log::info!("Selected {label} {model} in {}", path.display());
         }
         ModelAction::Update { model } => {
             validate_model_id(&model)?;
             ensure!(
-                config.contains_key("model"),
-                "no model is configured; use `lai config model set <MODEL>` first"
+                config.contains_key(key),
+                "no {label} is configured; use `lai config {command} set <MODEL>` first"
             );
-            config["model"] = value(&model);
+            config[key] = value(&model);
             save(&directory, &path, &config)?;
-            log::info!("Updated model to {model} in {}", path.display());
+            log::info!("Updated {label} to {model} in {}", path.display());
         }
         ModelAction::Unset => {
             ensure!(
-                config.contains_key("model"),
-                "no model is configured; use `lai config model set <MODEL>` first"
+                config.contains_key(key),
+                "no {label} is configured; use `lai config {command} set <MODEL>` first"
             );
             let comments = config
                 .as_table()
-                .key("model")
+                .key(key)
                 .and_then(|key| key.leaf_decor().prefix())
                 .and_then(|prefix| prefix.as_str())
                 .map(str::to_owned);
-            config.remove("model");
+            config.remove(key);
             if let Some(comments) = comments {
                 let trailing = match config.trailing().as_str() {
                     Some(text) => text,
@@ -284,7 +285,7 @@ pub fn run(action: ModelAction) -> anyhow::Result<()> {
                 config.set_trailing(format!("{comments}{trailing}"));
             }
             save(&directory, &path, &config)?;
-            log::info!("Removed the selected model from {}", path.display());
+            log::info!("Removed the selected {label} from {}", path.display());
         }
     }
     Ok(())

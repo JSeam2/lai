@@ -1,6 +1,6 @@
 use std::{
     env, fs, io,
-    path::{Component, Path, PathBuf},
+    path::{Component, Path},
     time::Duration,
 };
 
@@ -28,12 +28,7 @@ struct ModelFile {
 pub fn download(model: &str) -> anyhow::Result<()> {
     validate_model_id(model)?;
     let parts: Vec<_> = model.split('/').collect();
-    let home = env::var_os("HOME")
-        .context("HOME is not set; set it to your home directory before downloading")?;
-    let destination = PathBuf::from(home)
-        .join(".lai/models")
-        .join(parts[0])
-        .join(parts[1]);
+    let destination = lai::root()?.join("models").join(parts[0]).join(parts[1]);
     let endpoint = match env::var("HF_ENDPOINT") {
         Ok(value) => value,
         Err(env::VarError::NotPresent) => "https://huggingface.co".to_owned(),

@@ -1,6 +1,6 @@
 use crate::{
     cli::{Cli, Command, ConfigCommand},
-    download, key, model, pet, serve,
+    download, key, memory_control, model, pet, server,
 };
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
@@ -10,8 +10,12 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             pet,
             port,
             ready_signal,
-        } => serve::run(detached, pet, port, ready_signal),
-        Command::Kill => serve::kill(),
+        } => server::run(detached, pet, port, ready_signal),
+        Command::Kill => server::kill(),
+        Command::Memory { action } => memory_control::run(action),
+        Command::Config {
+            command: ConfigCommand::Memory { action },
+        } => memory_control::configure(action),
         Command::Download { model } => download::download(&model),
         Command::Key { action } => key::run(action),
         Command::Config {
@@ -26,7 +30,10 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         } => model::set_system_prompt(&prompt),
         Command::Config {
             command: ConfigCommand::Model { action },
-        } => model::run(action),
+        } => model::run(action, model::ModelKind::Chat),
+        Command::Config {
+            command: ConfigCommand::ModelMemory { action },
+        } => model::run(action, model::ModelKind::Memory),
         Command::Config {
             command: ConfigCommand::Pet { command },
         } => pet::config::run(command),

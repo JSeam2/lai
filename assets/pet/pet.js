@@ -1,5 +1,6 @@
 import * as THREE from './vendor/three.module.js';
 import { GLTFLoader } from './vendor/GLTFLoader.js';
+import { applyToonMaterials } from './toon.js';
 
 const bridge = (message) => window.webkit.messageHandlers.pet.postMessage(message);
 window.addEventListener('error', (event) => bridge({type: 'fatal', message: event.message || 'Pet renderer failed'}));
@@ -40,6 +41,7 @@ Promise.all([
   }),
 ]).then(([gltf, config]) => {
   animations = config;
+  applyToonMaterials(gltf.scene);
   scene.add(gltf.scene);
   mixer = new THREE.AnimationMixer(gltf.scene);
   for (const clip of gltf.animations) clips[clip.name] = clip;

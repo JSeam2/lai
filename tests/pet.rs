@@ -104,6 +104,7 @@ fn bundled_pet_assets_have_expected_content_types() {
     for (path, mime) in [
         ("/", "text/html"),
         ("/pet.js", "text/javascript"),
+        ("/toon.js", "text/javascript"),
         ("/vendor/three.module.js", "text/javascript"),
         ("/vendor/GLTFLoader.js", "text/javascript"),
         ("/vendor/BufferGeometryUtils.js", "text/javascript"),

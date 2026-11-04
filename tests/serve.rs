@@ -45,7 +45,7 @@ fn serve_reports_missing_download() {
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires an Apple Silicon Mac and LAI_TEST_MODEL pointing to a downloaded model"]
-fn logs_inference_for_both_completion_endpoints() -> anyhow::Result<()> {
+fn serves_inference_endpoints() -> anyhow::Result<()> {
     use std::{
         net::TcpListener,
         os::unix::fs::symlink,
@@ -105,6 +105,10 @@ fn logs_inference_for_both_completion_endpoints() -> anyhow::Result<()> {
             "completions",
             serde_json::json!({"model":"owner/model","prompt":"private prompt","max_tokens":2,"temperature":0}),
         ),
+        (
+            "responses",
+            serde_json::json!({"model":"owner/model","input":"private prompt","max_output_tokens":2,"temperature":0}),
+        ),
     ] {
         let response = client
             .post(format!("{base}/{endpoint}"))
@@ -116,6 +120,25 @@ fn logs_inference_for_both_completion_endpoints() -> anyhow::Result<()> {
             response.status()
         );
     }
+    let result: serde_json::Value = client.post(format!("{base}/responses"))
+        .json(&serde_json::json!({"model":"owner/model","input":"Hi","max_output_tokens":1,"temperature":0}))
+        .send()?.error_for_status()?.json()?;
+    assert_eq!(result["object"], "response");
+    assert_eq!(result["output"][0]["role"], "assistant");
+    assert!(result["usage"]["input_tokens"].as_u64().unwrap() > 0);
+    let streamed = client.post(format!("{base}/responses"))
+        .json(&serde_json::json!({"model":"owner/model","input":"Hi","max_output_tokens":1,"temperature":0,"stream":true}))
+        .send()?.error_for_status()?.text()?;
+    assert!(streamed.contains("event: response.created\n"));
+    assert!(streamed.contains("event: response.output_text.delta\n"));
+    assert!(
+        streamed.contains("event: response.incomplete\n")
+            || streamed.contains("event: response.completed\n")
+    );
+    let rejected = client.post(format!("{base}/responses"))
+        .json(&serde_json::json!({"model":"owner/model","input":"Hi","tools":[{"type":"web_search"}]}))
+        .send()?;
+    assert_eq!(rejected.status(), 400);
     let mut prompt_counts = Vec::new();
     for messages in [
         serde_json::json!([{"role":"user","content":"Hi"}]),
@@ -136,7 +159,7 @@ fn logs_inference_for_both_completion_endpoints() -> anyhow::Result<()> {
         "client system prompt should take precedence"
     );
     let logs = fs::read_to_string(logs)?;
-    for endpoint in ["/v1/chat/completions", "/v1/completions"] {
+    for endpoint in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
         assert!(
             logs.contains(&format!("Starting inference for {endpoint}")),
             "{logs}"

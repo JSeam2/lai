@@ -2,11 +2,11 @@ mod cli;
 mod cmd;
 mod download;
 mod key;
+#[path = "memory/control.rs"]
+mod memory_control;
 mod model;
 mod pet;
-mod serve;
-#[cfg(target_os = "macos")]
-mod server_control;
+mod server;
 
 use clap::Parser;
 
