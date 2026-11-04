@@ -14,6 +14,56 @@ use crate::{
 
 const DEFAULT_DRAFT_MODEL: &str = "mlx-community/gemma-4-E4B-it-assistant-bf16";
 
+pub fn set_system_prompt(prompt: &str) -> anyhow::Result<()> {
+    let home = env::var_os("HOME").context("HOME is not set; set it to your home directory")?;
+    let directory = PathBuf::from(home).join(".lai");
+    let path = directory.join("config.toml");
+    let mut config = match fs::read_to_string(&path) {
+        Ok(contents) => contents.parse::<DocumentMut>().with_context(|| {
+            format!(
+                "{} is not valid TOML; fix the file before changing settings",
+                path.display()
+            )
+        })?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => DocumentMut::new(),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    if prompt.is_empty() {
+        config.remove("system_prompt");
+    } else {
+        config["system_prompt"] = value(prompt);
+    }
+    save(&directory, &path, &config)?;
+    log::info!(
+        "{} system prompt in {}",
+        if prompt.is_empty() {
+            "Cleared"
+        } else {
+            "Updated"
+        },
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn system_prompt() -> anyhow::Result<Option<String>> {
+    let home = env::var_os("HOME").context("HOME is not set; set it to your home directory")?;
+    let path = PathBuf::from(home).join(".lai/config.toml");
+    let config = fs::read_to_string(&path)?
+        .parse::<DocumentMut>()
+        .with_context(|| format!("{} is not valid TOML", path.display()))?;
+    config
+        .get("system_prompt")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .context("system_prompt must be a string in config.toml")
+        })
+        .transpose()
+}
+
 pub fn selected_draft() -> anyhow::Result<Option<(String, PathBuf)>> {
     let home = env::var_os("HOME").context("HOME is not set; set it to your home directory")?;
     let root = PathBuf::from(home).join(".lai");
@@ -45,7 +95,7 @@ pub fn selected_draft() -> anyhow::Result<Option<(String, PathBuf)>> {
     let model_path = root.join("models").join(draft);
     ensure!(
         model_path.is_dir(),
-        "draft model {draft} is not installed at {}; run `lai download {draft}` or disable speculative decoding with `lai model speculativeDecoding false`",
+        "draft model {draft} is not installed at {}; run `lai download {draft}` or disable speculative decoding with `lai config speculativeDecoding false`",
         model_path.display()
     );
     Ok(Some((draft.to_owned(), model_path)))
@@ -262,7 +312,7 @@ fn prompt_download() -> anyhow::Result<bool> {
     }
 }
 
-fn save(
+pub(crate) fn save(
     directory: &std::path::Path,
     path: &std::path::Path,
     config: &DocumentMut,

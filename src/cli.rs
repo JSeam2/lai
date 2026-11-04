@@ -16,6 +16,9 @@ pub enum Command {
         /// Run the server in the background
         #[arg(short, long)]
         detached: bool,
+        /// Show the desktop pet while serving
+        #[arg(short, long)]
+        pet: bool,
         /// Local port to listen on
         #[arg(long, default_value_t = 8989)]
         port: u16,
@@ -37,15 +40,10 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Configure model inference
-    Model {
-        #[command(subcommand)]
-        command: InferenceCommand,
-    },
 }
 
 #[derive(Subcommand)]
-pub enum InferenceCommand {
+pub enum ConfigCommand {
     /// Enable or disable speculative decoding
     #[command(name = "speculativeDecoding")]
     SpeculativeDecoding {
@@ -56,15 +54,72 @@ pub enum InferenceCommand {
         #[arg(long)]
         draft_model: Option<String>,
     },
-}
-
-#[derive(Subcommand)]
-pub enum ConfigCommand {
+    /// Set the default system prompt (pass an empty string to clear it)
+    #[command(name = "systemPrompt")]
+    SystemPrompt { prompt: String },
     /// Manage the selected model
     Model {
         #[command(subcommand)]
         action: ModelAction,
     },
+    /// Configure the desktop pet
+    Pet {
+        #[command(subcommand)]
+        command: PetCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PetCommand {
+    /// Show the effective pet settings
+    Show,
+    /// Set or reset the pet's GLB model
+    Model {
+        #[command(subcommand)]
+        action: PetModelAction,
+    },
+    /// Set or reset the animation for an event
+    Animation {
+        #[command(subcommand)]
+        action: PetAnimationAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PetModelAction {
+    /// Use a GLB model (relative paths are resolved from ~/.lai)
+    Set { path: String },
+    /// Use the bundled cat
+    Unset,
+}
+
+#[derive(Subcommand)]
+pub enum PetAnimationAction {
+    /// Assign a GLB animation clip to an event
+    Set { event: PetEvent, clip: String },
+    /// Restore the default animation for an event
+    Unset { event: PetEvent },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum PetEvent {
+    Idle,
+    Waiting,
+    Reply,
+    Error,
+    Shutdown,
+}
+
+impl PetEvent {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Waiting => "waiting",
+            Self::Reply => "reply",
+            Self::Error => "error",
+            Self::Shutdown => "shutdown",
+        }
+    }
 }
 
 #[derive(Subcommand)]

@@ -58,7 +58,7 @@ impl Control {
         })
     }
 
-    pub fn start(&mut self) -> anyhow::Result<Arc<AtomicBool>> {
+    pub fn start(&mut self, stopped: Arc<AtomicBool>) -> anyhow::Result<()> {
         match fs::symlink_metadata(&self.socket_path) {
             Ok(metadata) => {
                 ensure!(
@@ -89,8 +89,7 @@ impl Control {
         self.socket_identity = Some((metadata.dev(), metadata.ino()));
         fs::set_permissions(&self.socket_path, fs::Permissions::from_mode(0o600))
             .context("cannot secure the server control socket")?;
-        let stopped = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&stopped);
+        let flag = stopped;
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let mut stream = match stream {
@@ -115,7 +114,7 @@ impl Control {
                 }
             }
         });
-        Ok(stopped)
+        Ok(())
     }
 }
 

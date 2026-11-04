@@ -3,6 +3,7 @@ mod cmd;
 mod download;
 mod key;
 mod model;
+mod pet;
 mod serve;
 #[cfg(target_os = "macos")]
 mod server_control;

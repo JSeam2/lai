@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self' blob:;">
+  <title>LAI pet</title>
+  <link rel="stylesheet" href="/pet.css">
+</head>
+<body>
+  <main id="pet">
+    <canvas id="cat" aria-label="Cat. Click to chat, drag to move, or right-click for options."></canvas>
+    <section id="conversation" hidden>
+      <div id="reply" role="status" aria-live="polite">Hello! What would you like to talk about?</div>
+      <form id="chat">
+        <input id="message" autocomplete="off" placeholder="Say something…" aria-label="Message the cat" maxlength="4000">
+        <button type="submit">Send</button>
+      </form>
+    </section>
+  </main>
+  <script type="module" src="/pet.js"></script>
+</body>
+</html>

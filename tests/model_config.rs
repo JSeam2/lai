@@ -208,13 +208,21 @@ fn malformed_config_is_not_overwritten() {
 fn can_enable_and_disable_speculative_decoding() {
     let home = tempfile::tempdir().expect("temporary home should be created");
     let directory = home.path().join(".lai");
+    let help = run(home.path(), &["config", "--help"]);
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("speculativeDecoding") && help.contains("systemPrompt"));
+    assert!(
+        !run(home.path(), &["model", "speculativeDecoding", "false"])
+            .status
+            .success()
+    );
     fs::create_dir_all(directory.join("models/owner/draft")).expect("draft directory should exist");
     fs::write(directory.join("config.toml"), "model = \"owner/target\"\n")
         .expect("config should be written");
     let output = run(
         home.path(),
         &[
-            "model",
+            "config",
             "speculativeDecoding",
             "true",
             "--draft-model",
@@ -232,7 +240,7 @@ fn can_enable_and_disable_speculative_decoding() {
             && contents.contains("draft_model = \"owner/draft\"")
             && contents.contains("speculative_decoding = true")
     );
-    let output = run(home.path(), &["model", "speculativeDecoding", "false"]);
+    let output = run(home.path(), &["config", "speculativeDecoding", "false"]);
     assert!(
         output.status.success(),
         "{}",
@@ -243,6 +251,51 @@ fn can_enable_and_disable_speculative_decoding() {
         contents.contains("model = \"owner/target\"")
             && contents.contains("speculative_decoding = false")
     );
+}
+
+#[test]
+fn system_prompt_can_be_set_replaced_and_cleared_without_losing_settings() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".lai");
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("config.toml");
+    fs::write(
+        &path,
+        "# keep\nmodel = 'owner/model'\n[pet.animations]\nidle = 'Blink'\n",
+    )
+    .unwrap();
+    for prompt in ["Be kind.\nUse \"short\" answers.", "A new prompt"] {
+        let output = run(home.path(), &["config", "systemPrompt", prompt]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config: toml_edit::DocumentMut = fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(config["system_prompt"].as_str(), Some(prompt));
+        assert_eq!(config["model"].as_str(), Some("owner/model"));
+        assert_eq!(config["pet"]["animations"]["idle"].as_str(), Some("Blink"));
+        assert!(fs::read_to_string(&path).unwrap().contains("# keep"));
+    }
+    let output = run(home.path(), &["config", "systemPrompt", ""]);
+    assert!(output.status.success());
+    let config: toml_edit::DocumentMut = fs::read_to_string(path).unwrap().parse().unwrap();
+    assert!(config.get("system_prompt").is_none());
+}
+
+#[test]
+fn system_prompt_creates_config_and_does_not_replace_invalid_toml() {
+    let home = tempfile::tempdir().unwrap();
+    assert!(
+        run(home.path(), &["config", "systemPrompt", "Hello"])
+            .status
+            .success()
+    );
+    let path = home.path().join(".lai/config.toml");
+    fs::write(&path, "model = [\n").unwrap();
+    let output = run(home.path(), &["config", "systemPrompt", "Changed"]);
+    assert!(!output.status.success());
+    assert_eq!(fs::read_to_string(path).unwrap(), "model = [\n");
 }
 
 #[test]

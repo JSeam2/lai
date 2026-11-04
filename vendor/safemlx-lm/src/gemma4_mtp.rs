@@ -56,6 +56,32 @@ pub fn generate_gemma4_mtp(
     prng_key: Option<Array>,
     stream: &Stream,
 ) -> Result<(Vec<u32>, MtpStats), Error> {
+    generate_gemma4_mtp_with_progress(
+        target,
+        assistant,
+        prompt_tokens,
+        eos_token_ids,
+        max_tokens,
+        temp,
+        prng_key,
+        stream,
+        &mut |_| {},
+    )
+}
+
+/// Generates tokens and reports the number of output tokens after each speculative round.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_gemma4_mtp_with_progress(
+    target: &mut Gemma4Model,
+    assistant: &mut Gemma4AssistantDraftModel,
+    prompt_tokens: &Array,
+    eos_token_ids: &[u32],
+    max_tokens: usize,
+    temp: f32,
+    prng_key: Option<Array>,
+    stream: &Stream,
+    progress: &mut dyn FnMut(usize),
+) -> Result<(Vec<u32>, MtpStats), Error> {
     let start = Instant::now();
     let mut prng_state = prng_key.map(RandomState::from_key);
     let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
@@ -101,6 +127,7 @@ pub fn generate_gemma4_mtp(
     }
 
     generated.push(bonus);
+    progress(generated.len());
     let mut hidden = first_out.hidden.try_index_device((.., -1.., ..), stream)?;
     let mut shared_kv = first_out.shared_kv_states;
     assistant.reset();
@@ -181,6 +208,7 @@ pub fn generate_gemma4_mtp(
             generated.push(id);
             emitted += 1;
         }
+        progress(generated.len());
         if emitted >= max_tokens {
             break;
         }

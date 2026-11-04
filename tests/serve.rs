@@ -69,7 +69,7 @@ fn logs_inference_for_both_completion_endpoints() -> anyhow::Result<()> {
     symlink(model_path, directory.join("model"))?;
     fs::write(
         home.path().join(".lai/config.toml"),
-        "model = \"owner/model\"\n",
+        "model = \"owner/model\"\nsystem_prompt = \"Follow these default instructions.\"\n",
     )?;
     let socket = TcpListener::bind("127.0.0.1:0")?;
     let port = socket.local_addr()?.port();
@@ -116,6 +116,25 @@ fn logs_inference_for_both_completion_endpoints() -> anyhow::Result<()> {
             response.status()
         );
     }
+    let mut prompt_counts = Vec::new();
+    for messages in [
+        serde_json::json!([{"role":"user","content":"Hi"}]),
+        serde_json::json!([{"role":"system","content":"Follow these default instructions."},{"role":"user","content":"Hi"}]),
+        serde_json::json!([{"role":"system","content":"Different instructions that are deliberately longer than the default system prompt."},{"role":"user","content":"Hi"}]),
+    ] {
+        let response: serde_json::Value = client.post(format!("{base}/chat/completions"))
+            .json(&serde_json::json!({"model":"owner/model","messages":messages,"max_tokens":1,"temperature":0}))
+            .send()?.error_for_status()?.json()?;
+        prompt_counts.push(response["usage"]["prompt_tokens"].as_u64().unwrap());
+    }
+    assert_eq!(
+        prompt_counts[0], prompt_counts[1],
+        "default prompt should be inserted exactly once"
+    );
+    assert_ne!(
+        prompt_counts[1], prompt_counts[2],
+        "client system prompt should take precedence"
+    );
     let logs = fs::read_to_string(logs)?;
     for endpoint in ["/v1/chat/completions", "/v1/completions"] {
         assert!(
@@ -125,6 +144,14 @@ fn logs_inference_for_both_completion_endpoints() -> anyhow::Result<()> {
         assert!(
             logs.contains(&format!("Finished inference for {endpoint}")),
             "{logs}"
+        );
+        let finished = logs
+            .lines()
+            .find(|line| line.contains(&format!("Finished inference for {endpoint}")))
+            .unwrap();
+        assert!(
+            finished.contains("tok/s including prompt processing"),
+            "{finished}"
         );
     }
     assert!(!logs.contains("private prompt"));

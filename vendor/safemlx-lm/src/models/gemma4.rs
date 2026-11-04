@@ -747,6 +747,27 @@ pub struct Gemma4TextOutput {
     pub shared_kv_states: HashMap<LayerType, (Array, Array)>,
 }
 
+fn apply_cached_rope(
+    rope: &mut RopeVariant,
+    x: &Array,
+    offset: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    if offset > 0 && x.shape()[2] == 1 {
+        // MLX's single-position RoPE produces different results from the same
+        // position in a prefill for this model. Evaluate two positions instead.
+        let padded = concatenate_axis(&[x.clone(), x.clone()], 2, stream)?;
+        let output = rope.forward(
+            nn::RopeInputBuilder::new(&padded)
+                .offset(offset - 1)
+                .build()?,
+            stream,
+        )?;
+        return output.try_index_device((.., .., 1..2, ..), stream);
+    }
+    rope.forward(nn::RopeInputBuilder::new(x).offset(offset).build()?, stream)
+}
+
 impl<C> Module<AttentionInput<'_, C>> for Attention
 where
     C: KeyValueCache,
@@ -778,10 +799,7 @@ where
             stream,
         )?;
         let offset = position_offset;
-        queries = self.rope.forward(
-            nn::RopeInputBuilder::new(&queries).offset(offset).build()?,
-            stream,
-        )?;
+        queries = apply_cached_rope(&mut self.rope, &queries, offset, stream)?;
 
         let (keys, values) = if self.is_kv_shared_layer {
             shared_kv
@@ -817,10 +835,7 @@ where
                 stream,
             )?
             .transpose_axes(&[0, 2, 1, 3], stream)?;
-            keys = self.rope.forward(
-                nn::RopeInputBuilder::new(&keys).offset(offset).build()?,
-                stream,
-            )?;
+            keys = apply_cached_rope(&mut self.rope, &keys, offset, stream)?;
             if let Some(cache) = cache.as_mut() {
                 (keys, values) = cache.update_and_fetch(keys, values, stream)?;
             }
@@ -923,12 +938,7 @@ impl Attention {
             stream,
         )?;
         observer.observe(&format!("{prefix}.q_norm"), &queries)?;
-        queries = self.rope.forward(
-            nn::RopeInputBuilder::new(&queries)
-                .offset(position_offset)
-                .build()?,
-            stream,
-        )?;
+        queries = apply_cached_rope(&mut self.rope, &queries, position_offset, stream)?;
         observer.observe(&format!("{prefix}.queries_rope"), &queries)?;
 
         let (keys, values) = if self.is_kv_shared_layer {
@@ -974,12 +984,7 @@ impl Attention {
             )?
             .transpose_axes(&[0, 2, 1, 3], stream)?;
             observer.observe(&format!("{prefix}.values"), &values)?;
-            keys = self.rope.forward(
-                nn::RopeInputBuilder::new(&keys)
-                    .offset(position_offset)
-                    .build()?,
-                stream,
-            )?;
+            keys = apply_cached_rope(&mut self.rope, &keys, position_offset, stream)?;
             observer.observe(&format!("{prefix}.keys_rope"), &keys)?;
             if let Some(cache) = cache.as_mut() {
                 (keys, values) = cache.update_and_fetch(keys, values, stream)?;
@@ -3022,6 +3027,20 @@ impl CausalLm<Cache> for Model {
         cache: &mut Cache,
         stream: &Stream,
     ) -> Result<Array, Exception> {
+        if cache.prefix_embeddings.is_none() {
+            return self.forward_logits(
+                ModelInput {
+                    inputs: input_tokens,
+                    inputs_embeds: None,
+                    per_layer_input_ids: None,
+                    mask: None,
+                    sliding_mask: None,
+                    cache: &mut cache.kv,
+                },
+                true,
+                stream,
+            );
+        }
         cache
             .token_ids
             .extend(token_ids_from_array(input_tokens, stream)?);
@@ -3084,6 +3103,7 @@ mod tests {
         load_gemma4_model, partial_rotary_dims, Attention, Cache, FloatOrString, LayerType,
         ModelArgs,
     };
+    use crate::cache::KeyValueCache;
     use crate::models::{
         common::CausalLm,
         input::{InputMetadata, InputPart, ModelInput},
@@ -3128,6 +3148,26 @@ mod tests {
             rope_scaling: None,
             rope_parameters: None,
         }
+    }
+
+    #[test]
+    fn text_decode_reuses_the_prefill_cache() {
+        let stream = test_stream();
+        let mut model = super::Model::new(model_args(false), &stream).unwrap();
+        let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let mut cache = Cache::default();
+        model
+            .prefill_input_logits(ModelInput::new(&parts), &mut cache, &stream)
+            .unwrap();
+        let next = Array::from_slice(&[4u32], &[1, 1]);
+        model.decode_logits(&next, &mut cache, &stream).unwrap();
+        assert_eq!(
+            cache.token_ids.len(),
+            3,
+            "text decoding should not rebuild the token history"
+        );
+        assert_eq!(cache.kv[0].as_ref().unwrap().offset(), 4);
     }
 
     #[test]

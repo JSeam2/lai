@@ -5,12 +5,111 @@ use std::{
 };
 
 #[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+#[cfg(target_os = "macos")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[cfg(target_os = "macos")]
 static REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 
 use anyhow::{Context, ensure};
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct InferenceProgress {
+    last_report: usize,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl InferenceProgress {
+    fn rate(tokens: usize, elapsed: std::time::Duration) -> f64 {
+        if elapsed.is_zero() {
+            0.0
+        } else {
+            tokens as f64 / elapsed.as_secs_f64()
+        }
+    }
+
+    fn update(&mut self, tokens: usize, elapsed: std::time::Duration) -> Option<f64> {
+        if tokens.saturating_sub(self.last_report) < 10 {
+            return None;
+        }
+        self.last_report = tokens;
+        Some(Self::rate(tokens, elapsed))
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::InferenceProgress;
+    use std::time::Duration;
+
+    #[test]
+    fn reports_progress_after_every_ten_additional_tokens() {
+        let mut progress = InferenceProgress::default();
+        assert_eq!(progress.update(2, Duration::from_secs(1)), None);
+        assert_eq!(progress.update(9, Duration::from_secs(3)), None);
+        assert_eq!(progress.update(10, Duration::from_secs(5)), Some(2.0));
+        assert_eq!(progress.update(19, Duration::from_secs(9)), None);
+        assert_eq!(progress.update(20, Duration::from_secs(10)), Some(2.0));
+    }
+
+    #[test]
+    fn speculative_rounds_can_cross_a_reporting_threshold() {
+        let mut progress = InferenceProgress::default();
+        assert_eq!(progress.update(9, Duration::from_secs(2)), None);
+        assert_eq!(progress.update(12, Duration::from_secs(3)), Some(4.0));
+        assert_eq!(progress.update(21, Duration::from_secs(5)), None);
+        assert_eq!(
+            progress.update(23, Duration::from_secs(6)),
+            Some(23.0 / 6.0)
+        );
+    }
+
+    #[test]
+    fn throughput_handles_zero_duration_and_no_tokens() {
+        assert_eq!(InferenceProgress::rate(5, Duration::ZERO), 0.0);
+        assert_eq!(InferenceProgress::rate(0, Duration::from_secs(2)), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod system_prompt_tests {
+    use super::{Message, apply_system_prompt};
+
+    fn msg(role: &str, content: &str) -> Message {
+        Message {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    #[test]
+    fn default_prompt_is_prepended_only_when_client_has_no_system_message() {
+        let mut messages = vec![msg("user", "Hi")];
+        apply_system_prompt(&mut messages, Some("Be kind"));
+        assert_eq!(
+            (messages[0].role.as_str(), messages[0].content.as_str()),
+            ("system", "Be kind")
+        );
+        assert_eq!(messages[1].content, "Hi");
+
+        let mut messages = vec![msg("system", "Client instructions"), msg("user", "Hi")];
+        apply_system_prompt(&mut messages, Some("Be kind"));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "Client instructions");
+
+        let mut messages = vec![msg("user", "Hi")];
+        apply_system_prompt(&mut messages, None);
+        assert_eq!(messages.len(), 1);
+    }
+}
+
+#[cfg(target_os = "macos")]
+use lai::pet::lifecycle::{detached_arguments, run_pet_lifecycle, wait_for_pet_ui};
 
 #[cfg(target_os = "macos")]
 use safemlx::{Device, DeviceType, ExecutionContext};
@@ -27,7 +126,7 @@ use serde_json::{Value, json};
 #[cfg(target_os = "macos")]
 use tiny_http::{Method, Response, Server, StatusCode};
 
-pub fn run(detached: bool, port: u16, ready_signal: bool) -> anyhow::Result<()> {
+pub fn run(detached: bool, pet: bool, port: u16, ready_signal: bool) -> anyhow::Result<()> {
     ensure!(
         port != 0,
         "port must be between 1 and 65535; choose a port with --port"
@@ -35,9 +134,57 @@ pub fn run(detached: bool, port: u16, ready_signal: bool) -> anyhow::Result<()> 
     let (model_id, model_path) = crate::model::selected_model()?;
     let draft = crate::model::selected_draft()?;
     if detached {
-        return start_detached(port);
+        return start_detached(port, pet);
     }
-    run_server(&model_id, &model_path, draft.as_ref(), port, ready_signal)
+    if pet {
+        return run_with_pet(model_id, model_path, draft, port, ready_signal);
+    }
+    run_server(
+        &model_id,
+        &model_path,
+        draft.as_ref(),
+        port,
+        ready_signal,
+        Default::default(),
+        None,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn run_with_pet(
+    model_id: String,
+    model_path: std::path::PathBuf,
+    draft: Option<(String, std::path::PathBuf)>,
+    port: u16,
+    ready_signal: bool,
+) -> anyhow::Result<()> {
+    let pet_ready = Arc::new(AtomicBool::new(false));
+    let worker_ready = Arc::clone(&pet_ready);
+    run_pet_lifecycle(
+        move |shutdown| {
+            run_server(
+                &model_id,
+                &model_path,
+                draft.as_ref(),
+                port,
+                ready_signal,
+                shutdown,
+                Some(worker_ready),
+            )
+        },
+        move |shutdown, done| crate::pet::run(port, shutdown, done, pet_ready),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_with_pet(
+    _: String,
+    _: std::path::PathBuf,
+    _: Option<(String, std::path::PathBuf)>,
+    _: u16,
+    _: bool,
+) -> anyhow::Result<()> {
+    anyhow::bail!("The desktop pet requires macOS")
 }
 
 #[cfg(target_os = "macos")]
@@ -51,7 +198,7 @@ pub fn kill() -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn start_detached(port: u16) -> anyhow::Result<()> {
+fn start_detached(port: u16, pet: bool) -> anyhow::Result<()> {
     use std::{
         fs::{self, OpenOptions},
         os::unix::process::CommandExt,
@@ -70,7 +217,7 @@ fn start_detached(port: u16) -> anyhow::Result<()> {
     let executable = std::env::current_exe().context("cannot find the LAI executable")?;
     let mut command = Command::new(executable);
     command
-        .args(["serve", "--port", &port.to_string(), "--ready-signal"])
+        .args(detached_arguments(port, pet))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(log_file));
@@ -108,7 +255,7 @@ fn start_detached(port: u16) -> anyhow::Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn start_detached(_: u16) -> anyhow::Result<()> {
+fn start_detached(_: u16, _: bool) -> anyhow::Result<()> {
     anyhow::bail!("MLX inference requires Apple Silicon and macOS")
 }
 
@@ -119,11 +266,14 @@ fn run_server(
     draft: Option<&(String, std::path::PathBuf)>,
     port: u16,
     ready_signal: bool,
+    stop_requested: Arc<AtomicBool>,
+    pet_ready: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<()> {
     ensure!(
         cfg!(target_arch = "aarch64"),
         "MLX inference requires an Apple Silicon Mac"
     );
+    let system_prompt = crate::model::system_prompt()?;
     let mut control = if ready_signal {
         Some(crate::server_control::Control::acquire()?)
     } else {
@@ -144,7 +294,7 @@ fn run_server(
         let target = match model.model_mut() {
             Model::Gemma4(target) => target,
             _ => anyhow::bail!(
-                "speculative decoding currently supports Gemma 4 models only; disable it with `lai model speculativeDecoding false`"
+                "speculative decoding currently supports Gemma 4 models only; disable it with `lai config speculativeDecoding false`"
             ),
         };
         log::info!(
@@ -174,10 +324,17 @@ fn run_server(
         None
     };
     log::info!("Serving {model_id} at http://127.0.0.1:{port}/v1");
-    let stop_requested = match &mut control {
-        Some(control) => Some(control.start()?),
-        None => None,
-    };
+    if let Some(control) = &mut control {
+        control.start(Arc::clone(&stop_requested))?;
+    }
+    if stop_requested.load(Ordering::Acquire)
+        || (ready_signal
+            && pet_ready
+                .as_ref()
+                .is_some_and(|ready| !wait_for_pet_ui(ready, &stop_requested)))
+    {
+        return Ok(());
+    }
     if ready_signal {
         println!("ready");
         std::io::stdout()
@@ -185,15 +342,19 @@ fn run_server(
             .context("cannot report server startup")?;
     }
     loop {
-        if stop_requested
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Acquire))
-        {
-            log::info!("Stopping detached LAI server");
+        if stop_requested.load(Ordering::Acquire) {
+            log::info!("Stopping LAI server");
             break;
         }
         if let Some(request) = server.recv_timeout(std::time::Duration::from_millis(250))? {
-            handle_request(request, model_id, &mut model, &mut assistant, stream);
+            handle_request(
+                request,
+                model_id,
+                &mut model,
+                &mut assistant,
+                stream,
+                system_prompt.as_deref(),
+            );
         }
     }
     Ok(())
@@ -206,6 +367,8 @@ fn run_server(
     _: Option<&(String, std::path::PathBuf)>,
     _: u16,
     _: bool,
+    _: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("MLX inference requires Apple Silicon and macOS")
 }
@@ -224,12 +387,27 @@ struct ChatRequest {
     n: Option<u32>,
 }
 
-#[cfg(target_os = "macos")]
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(target_os = "macos", derive(Deserialize))]
+#[cfg_attr(target_os = "macos", serde(deny_unknown_fields))]
 struct Message {
     role: String,
     content: String,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn apply_system_prompt(messages: &mut Vec<Message>, prompt: Option<&str>) {
+    if let Some(prompt) =
+        prompt.filter(|_| !messages.iter().any(|message| message.role == "system"))
+    {
+        messages.insert(
+            0,
+            Message {
+                role: "system".into(),
+                content: prompt.into(),
+            },
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -253,6 +431,7 @@ fn handle_request(
     model: &mut LoadedModel,
     assistant: &mut Option<Gemma4AssistantDraftModel>,
     stream: &safemlx::Stream,
+    system_prompt: Option<&str>,
 ) {
     if request.method() == &Method::Get && request.url() == "/v1/models" {
         respond(
@@ -287,7 +466,7 @@ fn handle_request(
         handle_completion(request, &body, model_id, model, assistant, stream);
         return;
     }
-    let input: ChatRequest = match serde_json::from_slice(&body) {
+    let mut input: ChatRequest = match serde_json::from_slice(&body) {
         Ok(input) => input,
         Err(error) => {
             respond_error(request, 400, &format!("invalid request: {error}"));
@@ -311,6 +490,7 @@ fn handle_request(
         );
         return;
     }
+    apply_system_prompt(&mut input.messages, system_prompt);
     let temperature = match input.temperature {
         Some(value) => value,
         None => {
@@ -340,7 +520,7 @@ fn handle_request(
         respond_error(
             request,
             400,
-            "speculative decoding currently requires temperature 0; set temperature to 0 or disable it with `lai model speculativeDecoding false`",
+            "speculative decoding currently requires temperature 0; set temperature to 0 or disable it with `lai config speculativeDecoding false`",
         );
         return;
     }
@@ -436,7 +616,7 @@ fn handle_completion(
         respond_error(
             request,
             400,
-            "speculative decoding currently requires temperature 0; set temperature to 0 or disable it with `lai model speculativeDecoding false`",
+            "speculative decoding currently requires temperature 0; set temperature to 0 or disable it with `lai config speculativeDecoding false`",
         );
         return;
     }
@@ -495,8 +675,9 @@ fn log_inference(
     let result = generate();
     match &result {
         Ok((_, prompt_tokens, completion_tokens, finish)) => log::info!(
-            "Finished inference for {endpoint} with model {model_id} in {:.2}s (prompt tokens: {prompt_tokens}, completion tokens: {completion_tokens}, finish: {finish})",
-            started.elapsed().as_secs_f64()
+            "Finished inference for {endpoint} with model {model_id} in {:.2}s (prompt tokens: {prompt_tokens}, completion tokens: {completion_tokens}, finish: {finish}, output: {:.2} tok/s including prompt processing)",
+            started.elapsed().as_secs_f64(),
+            InferenceProgress::rate(*completion_tokens, started.elapsed())
         ),
         Err(error) => log::error!(
             "Inference failed for {endpoint} with model {model_id} after {:.2}s: {error:#}",
@@ -535,6 +716,15 @@ fn generate_text(
     temperature: f32,
     max_tokens: usize,
 ) -> anyhow::Result<(String, usize, usize, &'static str)> {
+    let started = std::time::Instant::now();
+    let mut progress = InferenceProgress::default();
+    let mut report_progress = |count| {
+        if let Some(rate) = progress.update(count, started.elapsed()) {
+            log::info!(
+                "Inference progress: {count}/{max_tokens} output tokens ({rate:.2} tok/s including prompt processing)"
+            );
+        }
+    };
     let prompt_ids = model.encode(prompt, false)?;
     let tokens = model.encode_to_array(prompt, false, stream)?;
     let eos = model.eos_token_ids().to_vec();
@@ -543,7 +733,7 @@ fn generate_text(
             Model::Gemma4(target) => target,
             _ => anyhow::bail!("speculative decoding requires a Gemma 4 target"),
         };
-        let (generated, stats) = safemlx_lm::gemma4_mtp::generate_gemma4_mtp(
+        let (generated, stats) = safemlx_lm::gemma4_mtp::generate_gemma4_mtp_with_progress(
             target,
             assistant,
             &tokens,
@@ -552,6 +742,7 @@ fn generate_text(
             temperature,
             None,
             stream,
+            &mut report_progress,
         )?;
         log::info!(
             "Speculative decoding: accepted {} of {} draft tokens in {} rounds",
@@ -598,6 +789,7 @@ fn generate_text(
                 break;
             }
             generated.push(token);
+            report_progress(generated.len());
         }
     }
     Ok((
